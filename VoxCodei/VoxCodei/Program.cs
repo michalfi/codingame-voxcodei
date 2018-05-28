@@ -31,10 +31,19 @@ namespace VoxCodei
     {
         public IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount)
         {
-            var planGrid = grid.Clone();
+            var planGrid = new Grid(grid);
+            var clearedNodes = new bool[grid.Width, grid.Height];
+            var bombsUsed = 0;
 
-            for (int bombNumber = 0; bombNumber < bombCount; bombNumber++)
+            for (int roundNumber = 0; roundNumber < rounds; roundNumber++)
             {
+                planGrid.Tick();
+                if (bombsUsed == bombCount)
+                {
+                    yield return null;
+                    continue;
+                }
+
                 var positions = Enumerable.Range(0, grid.Width)
                     .SelectMany(col => Enumerable.Range(0, grid.Height).Select(row => new {col, row}))
                     .Where(pos => planGrid.GetCell(pos.col, pos.row) == CellContents.Empty);
@@ -43,7 +52,7 @@ namespace VoxCodei
                 {
                     pos.col,
                     pos.row,
-                    nodes = CountBlastedNodes(pos.col, pos.row, planGrid)
+                    nodes = CountBlastedNodes(pos.col, pos.row, planGrid, clearedNodes)
                 });
 
                 var best = effect.OrderByDescending(x => x.nodes).First();
@@ -54,19 +63,19 @@ namespace VoxCodei
                 }
 
                 yield return new Bomb(best.col, best.row);
-                planGrid.VisitBlast(best.col, best.row, (col, row, contents) => planGrid.Clear(col, row));
+                planGrid.VisitBlast(best.col, best.row, (col, row, contents) => { clearedNodes[col, row] = true; });
+                planGrid.PutBomb(best.col, best.row);
+                bombsUsed++;
             }
-
-            for (int waitNumber = 0; waitNumber < rounds - bombCount; waitNumber++)
-                yield return null;
         }
 
-        private int CountBlastedNodes(int col, int row, Grid grid)
+        private int CountBlastedNodes(int col, int row, Grid grid, bool[,] clearedNodes)
         {
             var count = 0;
             grid.VisitBlast(col, row, (c, r, contents) =>
             {
-                if (contents == CellContents.Node) count++;
+                if (contents == CellContents.Node && !clearedNodes[c, r])
+                    count++;
             });
             return count;
         }
@@ -171,6 +180,14 @@ namespace VoxCodei
             Cells = new CellContents[width, height];
         }
 
+        public Grid(Grid other)
+        {
+            Width = other.Width;
+            Height = other.Height;
+            Cells = (CellContents[,]) other.Cells.Clone();
+            Bombs = new List<Bomb>(other.Bombs);
+        }
+
         public int Width { get; }
 
         public int Height { get; }
@@ -265,15 +282,6 @@ namespace VoxCodei
                     action(blastCol, blastRow, contents);
                 }
             }
-        }
-
-        public Grid Clone()
-        {
-            var clone = new Grid(Width, Height);
-            for (int col = 0; col < Width; col++)
-            for (int row = 0; row < Height; row++)
-                clone.Cells[col, row] = Cells[col, row];
-            return clone;
         }
 
         private void Explode(Bomb bomb, Action<Bomb> trigger)
