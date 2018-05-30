@@ -28,60 +28,6 @@ namespace VoxCodei
         IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount);
     }
 
-    public class GreedyStrategy : IStrategy
-    {
-        public IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount)
-        {
-            var planGrid = new Grid(grid);
-            var clearedNodes = new bool[grid.Width, grid.Height];
-            var bombsUsed = 0;
-
-            for (int roundNumber = 0; roundNumber < rounds; roundNumber++)
-            {
-                planGrid.Tick();
-                if (bombsUsed == bombCount)
-                {
-                    yield return null;
-                    continue;
-                }
-
-                var positions = Enumerable.Range(0, grid.Width)
-                    .SelectMany(col => Enumerable.Range(0, grid.Height).Select(row => new {col, row}))
-                    .Where(pos => planGrid.GetCell(pos.col, pos.row) == CellContents.Empty);
-
-                var effect = positions.Select(pos => new
-                {
-                    pos.col,
-                    pos.row,
-                    nodes = CountBlastedNodes(pos.col, pos.row, planGrid, clearedNodes)
-                });
-
-                var best = effect.OrderByDescending(x => x.nodes).First();
-                if (best.nodes == 0)
-                {
-                    yield return null;
-                    continue;
-                }
-
-                yield return new Bomb(best.col, best.row);
-                planGrid.VisitBlast(best.col, best.row, (col, row, contents) => { clearedNodes[col, row] = true; });
-                planGrid.PutBomb(best.col, best.row);
-                bombsUsed++;
-            }
-        }
-
-        private int CountBlastedNodes(int col, int row, Grid grid, bool[,] clearedNodes)
-        {
-            var count = 0;
-            grid.VisitBlast(col, row, (c, r, contents) =>
-            {
-                if (contents == CellContents.Node && !clearedNodes[c, r])
-                    count++;
-            });
-            return count;
-        }
-    }
-
     public class BruteStrategy : IStrategy
     {
         public BruteStrategy(TextWriter debug)
@@ -160,78 +106,6 @@ namespace VoxCodei
         }
     }
 
-    public class GuessingStrategy : IStrategy
-    {
-        public IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount)
-        {
-            var potentials = Enumerable.Range(0, grid.Width)
-                .SelectMany(col => Enumerable.Range(0, grid.Height).Select(row => new {col, row}))
-                .Where(pos => grid.GetCell(pos.col, pos.row) != CellContents.Passive).Select(pos =>
-                    new PotentialBomb(pos.col, pos.row,
-                        grid.EnumerateBlast(pos.col, pos.row).Where(blasted =>
-                            grid.GetCell(blasted.Col, blasted.Row) == CellContents.Node))).ToList();
-
-            var nodeCount = grid.Count(CellContents.Node);
-            var set = new BombSet();
-            while (nodeCount > set.ClearedCount)
-            {
-                var chosen = potentials.OrderByDescending(bomb => set.Diff(bomb))
-                    .ThenByDescending(bomb => bomb.Blast.Length).First();
-                potentials.Remove(chosen);
-                set.Add(chosen);
-                set.Simplify();
-            }
-
-            var bombs = set.Bombs.ToArray();
-            Console.Error.WriteLine("Set found: " + string.Join(", ", bombs.Select(b => $"{b.Col}:{b.Row}")));
-            var orderer = new BombOrderer(grid);
-
-            var order = orderer.Order(bombs).ToArray();
-            return order.Concat(Enumerable.Repeat<Bomb>(null, Math.Max(rounds - order.Length, 1)));
-        }
-
-        private class BombSet
-        {
-            public void Add(PotentialBomb bomb)
-            {
-                BombMap.Add(bomb.Position, bomb);
-                foreach (var cleared in bomb.Blast)
-                {
-                    if (!ClearedNodes.TryGetValue(cleared, out var coverCount))
-                        coverCount = 0;
-                    ClearedNodes[cleared] = coverCount + 1;
-                }
-            }
-
-            public int Diff(PotentialBomb bomb)
-            {
-                return bomb.Blast.Count(pos => !ClearedNodes.ContainsKey(pos));
-            }
-
-            public void Simplify()
-            {
-                foreach (var bomb in BombMap.Values)
-                {
-                    var minCover = bomb.Blast.Min(pos => ClearedNodes[pos]);
-                    if (minCover > 1)
-                    {
-                        foreach (var cleared in bomb.Blast)
-                            ClearedNodes[cleared] -= 1;
-                        BombMap.Remove(bomb.Position);
-                    }
-                }
-            }
-
-            public IEnumerable<Coords> Bombs => BombMap.Keys;
-
-            public int ClearedCount => ClearedNodes.Count;
-
-            private Dictionary<Coords, PotentialBomb> BombMap { get; } = new Dictionary<Coords, PotentialBomb>();
-
-            private Dictionary<Coords, int> ClearedNodes { get; } = new Dictionary<Coords, int>();
-        }
-    }
-
     public class PotentialBomb
     {
         public PotentialBomb(int col, int row, IEnumerable<Coords> blast)
@@ -248,68 +122,6 @@ namespace VoxCodei
         {
             return string.Join(", ", Blast.OrderBy(b => b.Col).ThenBy(b => b.Row));
         }
-    }
-
-    public class BombOrderer
-    {
-        public BombOrderer(Grid grid)
-        {
-            Grid = grid;
-        }
-
-        private Grid Grid { get; }
-
-        public IEnumerable<Bomb> Order(IEnumerable<Coords> bombPositions)
-        {
-            var remaining = bombPositions.ToList();
-            var levels = remaining.ToDictionary(b => b, b => int.MaxValue);
-            var clearers = new Dictionary<Coords, Coords>();
-            var g = new Grid(Grid);
-
-            while (remaining.Count > 0)
-            {
-                var possible = remaining.Where(pos => g.GetCell(pos.Col, pos.Row) == CellContents.Empty).ToArray();
-                foreach (var pos in possible)
-                {
-                    foreach (var cleared in g.EnumerateBlast(pos.Col, pos.Row))
-                    {
-                        if (remaining.Contains(cleared))
-                            clearers[cleared] = pos;
-                        g.Clear(pos.Col, pos.Row);
-                    }
-
-                    remaining.Remove(pos);
-
-                    int level = clearers.TryGetValue(pos, out var clearer) ? levels[clearer] + 1 : 0;
-                    levels[pos] = level;
-                }
-            }
-            Console.Error.WriteLine("Levels computed");
-
-            var depths = new Dictionary<Coords, int>();
-            foreach (var level in levels.OrderByDescending(level => level.Value))
-                depths[level.Key] = depths.TryGetValue(level.Key, out var childDepth) ? childDepth + 1 : 0;
-            Console.Error.WriteLine("Depths computed");
-
-            g = new Grid(Grid);
-            var bombs = depths.Select(x => new {pos = x.Key, depth = x.Value}).OrderByDescending(x => x.depth).ToList();
-            while (bombs.Count > 0)
-            {
-                g.Tick();
-                var bomb = bombs.FirstOrDefault(x => g.GetCell(x.pos.Col, x.pos.Row) == CellContents.Empty);
-                if (bomb == null)
-                {
-                    yield return null;
-                    continue;
-                }
-
-                yield return new Bomb(bomb.pos.Col, bomb.pos.Row);
-                g.PutBomb(bomb.pos.Col, bomb.pos.Row);
-                bombs.RemoveAll(x => x.pos.Equals(bomb.pos));
-            }
-        }
-
-
     }
 
     public class Player
