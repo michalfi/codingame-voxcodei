@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace VoxCodei
@@ -11,7 +12,7 @@ namespace VoxCodei
     {
         static void Main(string[] args)
         {
-            var player = new Player(Console.In, Console.Out, Console.Error, new GreedyStrategy());
+            var player = new Player(Console.In, Console.Out, Console.Error, new BruteStrategy(Console.Error));
 
             player.Init();
 
@@ -79,6 +80,236 @@ namespace VoxCodei
             });
             return count;
         }
+    }
+
+    public class BruteStrategy : IStrategy
+    {
+        public BruteStrategy(TextWriter debug)
+        {
+            Debug = debug;
+        }
+
+        private TextWriter Debug { get; }
+
+        public IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount)
+        {
+            var potentials = Enumerable.Range(0, grid.Width)
+                .SelectMany(col => Enumerable.Range(0, grid.Height).Select(row => new {col, row}))
+                .Where(pos => grid.GetCell(pos.col, pos.row) != CellContents.Passive)
+                .Select(pos =>
+                    new PotentialBomb(pos.col, pos.row,
+                        grid.EnumerateBlast(pos.col, pos.row).Where(blasted =>
+                            grid.GetCell(blasted.Col, blasted.Row) == CellContents.Node))).ToArray();
+            var simplified = potentials.Where(b => grid.GetCell(b.Position.Col, b.Position.Row) == CellContents.Empty)
+                .GroupBy(b => b.BlastString()).Select(g => g.First());
+            var interesting = potentials.Where(b => grid.GetCell(b.Position.Col, b.Position.Row) == CellContents.Node)
+                .Concat(simplified).ToArray();
+
+            var plan = Plan(grid, grid, rounds + 1, bombCount, interesting, true);
+            if (plan == null)
+            {
+                Debug.WriteLine("Failed");
+                return Enumerable.Repeat<Bomb>(null, rounds);
+            }
+
+            return plan.Concat(Enumerable.Repeat<Bomb>(null, rounds - plan.Length));
+        }
+
+        public Bomb[] Plan(Grid simulation, Grid result, int rounds, int bombCount, PotentialBomb[] blasts, bool afterBomb)
+        {
+            var exploded = new List<Coords>();
+            simulation.Tick((col, row) => exploded.Add(new Coords(col, row)));
+
+            if (result.Count(CellContents.Node) == 0)
+                return new Bomb[0];
+
+            if (bombCount <= 0 || rounds <= 0)
+                return null;
+
+            var triedBlasts = afterBomb
+                ? blasts.Where(b => simulation.GetCell(b.Position.Col, b.Position.Row) == CellContents.Empty)
+                : blasts.Where(b => exploded.Contains(b.Position));
+
+            var options = triedBlasts
+                .Select(b => new {pos = b.Position, effect = b.Blast.Count(blast => result.GetCell(blast.Col, blast.Row) == CellContents.Node) })
+                .Where(b => b.effect > 0)
+                .OrderByDescending(b => b.effect)
+                .Select(b => b.pos).ToArray();
+
+            foreach (var option in options)
+            {
+                var updatedSimulation = new Grid(simulation);
+                updatedSimulation.PutBomb(option.Col, option.Row);
+                var updatedResult = new Grid(result);
+                updatedResult.VisitBlast(option.Col, option.Row, (col, row, contents) => updatedResult.Clear(col, row));
+
+                var plan = Plan(updatedSimulation, updatedResult, rounds - 1, bombCount - 1, blasts, true);
+                if (plan != null)
+                    return new[] {new Bomb(option.Col, option.Row)}.Concat(plan).ToArray();
+            }
+
+            if (simulation.GetBombCount() > 0)
+            {
+                var waitSimulation = new Grid(simulation);
+                var waitPlan = Plan(waitSimulation, result, rounds - 1, bombCount, blasts, false);
+                if (waitPlan != null)
+                    return new Bomb[] {null}.Concat(waitPlan).ToArray();
+            }
+
+            return null;
+        }
+    }
+
+    public class GuessingStrategy : IStrategy
+    {
+        public IEnumerable<Bomb> PlanActions(Grid grid, int rounds, int bombCount)
+        {
+            var potentials = Enumerable.Range(0, grid.Width)
+                .SelectMany(col => Enumerable.Range(0, grid.Height).Select(row => new {col, row}))
+                .Where(pos => grid.GetCell(pos.col, pos.row) != CellContents.Passive).Select(pos =>
+                    new PotentialBomb(pos.col, pos.row,
+                        grid.EnumerateBlast(pos.col, pos.row).Where(blasted =>
+                            grid.GetCell(blasted.Col, blasted.Row) == CellContents.Node))).ToList();
+
+            var nodeCount = grid.Count(CellContents.Node);
+            var set = new BombSet();
+            while (nodeCount > set.ClearedCount)
+            {
+                var chosen = potentials.OrderByDescending(bomb => set.Diff(bomb))
+                    .ThenByDescending(bomb => bomb.Blast.Length).First();
+                potentials.Remove(chosen);
+                set.Add(chosen);
+                set.Simplify();
+            }
+
+            var bombs = set.Bombs.ToArray();
+            Console.Error.WriteLine("Set found: " + string.Join(", ", bombs.Select(b => $"{b.Col}:{b.Row}")));
+            var orderer = new BombOrderer(grid);
+
+            var order = orderer.Order(bombs).ToArray();
+            return order.Concat(Enumerable.Repeat<Bomb>(null, Math.Max(rounds - order.Length, 1)));
+        }
+
+        private class BombSet
+        {
+            public void Add(PotentialBomb bomb)
+            {
+                BombMap.Add(bomb.Position, bomb);
+                foreach (var cleared in bomb.Blast)
+                {
+                    if (!ClearedNodes.TryGetValue(cleared, out var coverCount))
+                        coverCount = 0;
+                    ClearedNodes[cleared] = coverCount + 1;
+                }
+            }
+
+            public int Diff(PotentialBomb bomb)
+            {
+                return bomb.Blast.Count(pos => !ClearedNodes.ContainsKey(pos));
+            }
+
+            public void Simplify()
+            {
+                foreach (var bomb in BombMap.Values)
+                {
+                    var minCover = bomb.Blast.Min(pos => ClearedNodes[pos]);
+                    if (minCover > 1)
+                    {
+                        foreach (var cleared in bomb.Blast)
+                            ClearedNodes[cleared] -= 1;
+                        BombMap.Remove(bomb.Position);
+                    }
+                }
+            }
+
+            public IEnumerable<Coords> Bombs => BombMap.Keys;
+
+            public int ClearedCount => ClearedNodes.Count;
+
+            private Dictionary<Coords, PotentialBomb> BombMap { get; } = new Dictionary<Coords, PotentialBomb>();
+
+            private Dictionary<Coords, int> ClearedNodes { get; } = new Dictionary<Coords, int>();
+        }
+    }
+
+    public class PotentialBomb
+    {
+        public PotentialBomb(int col, int row, IEnumerable<Coords> blast)
+        {
+            Position = new Coords(col, row);
+            Blast = blast.ToArray();
+        }
+
+        public Coords Position { get; }
+
+        public Coords[] Blast { get; }
+
+        public string BlastString()
+        {
+            return string.Join(", ", Blast.OrderBy(b => b.Col).ThenBy(b => b.Row));
+        }
+    }
+
+    public class BombOrderer
+    {
+        public BombOrderer(Grid grid)
+        {
+            Grid = grid;
+        }
+
+        private Grid Grid { get; }
+
+        public IEnumerable<Bomb> Order(IEnumerable<Coords> bombPositions)
+        {
+            var remaining = bombPositions.ToList();
+            var levels = remaining.ToDictionary(b => b, b => int.MaxValue);
+            var clearers = new Dictionary<Coords, Coords>();
+            var g = new Grid(Grid);
+
+            while (remaining.Count > 0)
+            {
+                var possible = remaining.Where(pos => g.GetCell(pos.Col, pos.Row) == CellContents.Empty).ToArray();
+                foreach (var pos in possible)
+                {
+                    foreach (var cleared in g.EnumerateBlast(pos.Col, pos.Row))
+                    {
+                        if (remaining.Contains(cleared))
+                            clearers[cleared] = pos;
+                        g.Clear(pos.Col, pos.Row);
+                    }
+
+                    remaining.Remove(pos);
+
+                    int level = clearers.TryGetValue(pos, out var clearer) ? levels[clearer] + 1 : 0;
+                    levels[pos] = level;
+                }
+            }
+            Console.Error.WriteLine("Levels computed");
+
+            var depths = new Dictionary<Coords, int>();
+            foreach (var level in levels.OrderByDescending(level => level.Value))
+                depths[level.Key] = depths.TryGetValue(level.Key, out var childDepth) ? childDepth + 1 : 0;
+            Console.Error.WriteLine("Depths computed");
+
+            g = new Grid(Grid);
+            var bombs = depths.Select(x => new {pos = x.Key, depth = x.Value}).OrderByDescending(x => x.depth).ToList();
+            while (bombs.Count > 0)
+            {
+                g.Tick();
+                var bomb = bombs.FirstOrDefault(x => g.GetCell(x.pos.Col, x.pos.Row) == CellContents.Empty);
+                if (bomb == null)
+                {
+                    yield return null;
+                    continue;
+                }
+
+                yield return new Bomb(bomb.pos.Col, bomb.pos.Row);
+                g.PutBomb(bomb.pos.Col, bomb.pos.Row);
+                bombs.RemoveAll(x => x.pos.Equals(bomb.pos));
+            }
+        }
+
+
     }
 
     public class Player
@@ -169,6 +400,11 @@ namespace VoxCodei
 
         public int Row;
         public int Col;
+
+        public override string ToString()
+        {
+            return $"{Col}:{Row}";
+        }
     }
 
     public class Grid
@@ -185,7 +421,7 @@ namespace VoxCodei
             Width = other.Width;
             Height = other.Height;
             Cells = (CellContents[,]) other.Cells.Clone();
-            Bombs = new List<Bomb>(other.Bombs);
+            Bombs = new List<Bomb>(other.Bombs.Select(b => new Bomb(b)));
         }
 
         public int Width { get; }
@@ -205,6 +441,8 @@ namespace VoxCodei
         };
 
         private static string CellTranslation = ".#@B";
+
+        public int GetBombCount() => Bombs.Count;
 
         public CellContents GetCell(int col, int row)
         {
@@ -232,7 +470,9 @@ namespace VoxCodei
             Cells[col, row] = CellContents.Empty;
         }
 
-        public void Tick()
+        public delegate void NodeCleared(int col, int row);
+
+        public void Tick(NodeCleared action = null)
         {
             var triggered = new Queue<Bomb>();
             foreach (var bomb in Bombs)
@@ -245,7 +485,7 @@ namespace VoxCodei
             while (triggered.Count > 0)
             {
                 var bomb = triggered.Dequeue();
-                Explode(bomb, triggered.Enqueue);
+                Explode(bomb, triggered.Enqueue, action);
                 Bombs.Remove(bomb);
                 Clear(bomb.Col, bomb.Row);
             }
@@ -263,6 +503,11 @@ namespace VoxCodei
         }
 
         public delegate void CellVisit(int col, int row, CellContents contents);
+
+        public int Count(CellContents type)
+        {
+            return Cells.Cast<CellContents>().Count(c => c == type);
+        }
 
         public void VisitBlast(int col, int row, CellVisit action)
         {
@@ -284,7 +529,27 @@ namespace VoxCodei
             }
         }
 
-        private void Explode(Bomb bomb, Action<Bomb> trigger)
+        public IEnumerable<Coords> EnumerateBlast(int col, int row)
+        {
+            foreach (var dir in Directions)
+            {
+                for (int i = 1; i < 4; i++)
+                {
+                    int blastCol = col + dir.Item1 * i;
+                    int blastRow = row + dir.Item2 * i;
+                    if (blastRow < 0 || blastRow >= Height || blastCol < 0 || blastCol >= Width)
+                        break;
+
+                    var contents = Cells[blastCol, blastRow];
+                    if (contents == CellContents.Passive)
+                        break;
+
+                    yield return new Coords(blastCol, blastRow);
+                }
+            }
+        }
+
+        private void Explode(Bomb bomb, Action<Bomb> trigger, NodeCleared action)
         {
             VisitBlast(bomb.Col, bomb.Row, (col, row, contents) => {
                 switch (contents)
@@ -294,6 +559,8 @@ namespace VoxCodei
                         break;
                     case CellContents.Node:
                         Clear(col, row);
+                        if (action != null)
+                            action(col, row);
                         break;
                 }
             });
@@ -307,6 +574,13 @@ namespace VoxCodei
             Col = col;
             Row = row;
             Timer = 4;
+        }
+
+        public Bomb(Bomb other)
+        {
+            Col = other.Col;
+            Row = other.Row;
+            Timer = other.Timer;
         }
 
         public int Col { get; }
